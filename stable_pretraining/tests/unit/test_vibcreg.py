@@ -1,10 +1,11 @@
-"""Single-process unit tests for the VIbCReg building blocks.
+"""Single-process unit tests for VIbCReg.
 
 Covers :class:`IterNorm` (whitening quality, running statistics, eval-mode
-behavior, dtype handling, gradients) and :class:`VIbCRegLoss` (closed-form
+behavior, dtype handling, gradients), :class:`VIbCRegLoss` (closed-form
 values on collapsed and duplicated features, scale invariance of the
-decorrelation term, coefficient weighting). Under a single process the
-cross-GPU gather in the loss is a no-op.
+decorrelation term, coefficient weighting), and the :class:`VIbCReg` method
+class and ``vibcreg`` forward function. Under a single process the cross-GPU
+gather in the loss is a no-op.
 """
 
 import math
@@ -12,6 +13,7 @@ import math
 import pytest
 import torch
 
+import stable_pretraining as spt
 from stable_pretraining.backbone import IterNorm
 from stable_pretraining.losses import VIbCRegLoss
 
@@ -209,3 +211,108 @@ class TestVIbCRegLoss:
 
         assert all(math.isfinite(v) for v in losses)
         assert losses[-1] < losses[0]
+
+
+class _TinyEncoder(torch.nn.Module):
+    """Pooled-conv encoder so method tests run in milliseconds on CPU."""
+
+    def __init__(self, dim: int = 32):
+        super().__init__()
+        self.conv = torch.nn.Conv2d(3, dim, kernel_size=3, padding=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.conv(x).mean(dim=(2, 3))
+
+
+@pytest.mark.unit
+class TestVIbCRegMethod:
+    """Unit tests for the VIbCReg method class and forward function."""
+
+    def test_default_projector_matches_reference_recipe(self):
+        model = spt.VIbCReg(encoder_name=_TinyEncoder())
+        layers = list(model.projector)
+
+        assert [type(m) for m in layers] == [
+            torch.nn.Linear,
+            torch.nn.BatchNorm1d,
+            torch.nn.GELU,
+            torch.nn.Linear,
+            torch.nn.BatchNorm1d,
+            torch.nn.GELU,
+            torch.nn.Linear,
+            IterNorm,
+        ]
+        assert layers[-1].num_features == 2048
+        assert layers[-1].num_groups == 64 and layers[-1].T == 5
+        assert (
+            model.vibcreg_loss.sim_coeff,
+            model.vibcreg_loss.std_coeff,
+            model.vibcreg_loss.cov_coeff,
+        ) == (25.0, 25.0, 200.0)
+
+    def test_iternorm_can_be_disabled(self):
+        model = spt.VIbCReg(
+            encoder_name=_TinyEncoder(), projector_dims=(64, 64), iternorm=False
+        )
+
+        assert not any(isinstance(m, IterNorm) for m in model.projector)
+        assert isinstance(model.projector[-1], torch.nn.Linear)
+
+    def test_train_and_eval_outputs(self):
+        torch.manual_seed(0)
+        model = spt.VIbCReg(
+            encoder_name=_TinyEncoder(), projector_dims=(64, 64), iternorm_groups=8
+        )
+        v1, v2 = torch.randn(8, 3, 16, 16), torch.randn(8, 3, 16, 16)
+
+        model.train()
+        out = model(v1, v2)
+        assert out.embedding.shape == (16, 32)
+        assert out.projection.shape == (16, 64)
+        assert out.loss.ndim == 0 and torch.isfinite(out.loss)
+
+        model.eval()
+        with torch.no_grad():
+            out = model(v1)
+        assert out.embedding.shape == (8, 32)
+        assert out.projection is None
+        assert out.loss.item() == 0
+
+    def test_forward_function_with_module(self):
+        """The ``vibcreg`` forward fn trains end-to-end inside ``spt.Module``."""
+        torch.manual_seed(0)
+        module = spt.Module(
+            forward=spt.forward.vibcreg,
+            backbone=_TinyEncoder(),
+            projector=torch.nn.Sequential(
+                torch.nn.Linear(32, 64), IterNorm(64, num_groups=8)
+            ),
+            vibcreg_loss=VIbCRegLoss(),
+        )
+        module.log = lambda *args, **kwargs: None
+        module.train()
+        batch = {
+            "views": [
+                {"image": torch.randn(8, 3, 16, 16), "label": torch.arange(8)},
+                {"image": torch.randn(8, 3, 16, 16), "label": torch.arange(8)},
+            ]
+        }
+
+        out = module.forward(batch, "train")
+        out["loss"].backward()
+
+        assert out["embedding"].shape == (16, 32)
+        assert torch.equal(out["label"], torch.cat([torch.arange(8)] * 2))
+        assert module.projector[1].weight.grad is not None
+
+    def test_forward_function_rejects_wrong_view_count(self):
+        module = spt.Module(
+            forward=spt.forward.vibcreg,
+            backbone=_TinyEncoder(),
+            projector=torch.nn.Linear(32, 64),
+            vibcreg_loss=VIbCRegLoss(),
+        )
+        batch = {"views": [{"image": torch.randn(4, 3, 16, 16)} for _ in range(3)]}
+
+        with pytest.raises(ValueError, match="exactly 2 views"):
+            module.forward(batch, "train")
