@@ -258,25 +258,47 @@ class TestVIbCRegMethod:
         assert not any(isinstance(m, IterNorm) for m in model.projector)
         assert isinstance(model.projector[-1], torch.nn.Linear)
 
-    def test_train_and_eval_outputs(self):
+    @pytest.mark.parametrize("layout", ["views_list", "named_views"])
+    def test_dict_forward_in_training(self, layout):
+        """``forward(batch, stage)`` accepts both multi-view batch layouts."""
         torch.manual_seed(0)
         model = spt.VIbCReg(
             encoder_name=_TinyEncoder(), projector_dims=(64, 64), iternorm_groups=8
         )
-        v1, v2 = torch.randn(8, 3, 16, 16), torch.randn(8, 3, 16, 16)
-
+        model.log = lambda *args, **kwargs: None
         model.train()
-        out = model(v1, v2)
-        assert out.embedding.shape == (16, 32)
-        assert out.projection.shape == (16, 64)
-        assert out.loss.ndim == 0 and torch.isfinite(out.loss)
+        views = [
+            {"image": torch.randn(8, 3, 16, 16), "label": torch.arange(8)}
+            for _ in range(2)
+        ]
+        if layout == "views_list":
+            batch = {"views": views}
+        else:
+            batch = {"view_0": views[0], "view_1": views[1]}
 
+        out = model(batch, stage="fit")
+        out["loss"].backward()
+
+        assert isinstance(out, dict)
+        assert out["loss"].ndim == 0 and torch.isfinite(out["loss"])
+        assert out["embedding"].shape == (16, 32)
+        assert torch.equal(out["label"], torch.cat([torch.arange(8)] * 2))
+        assert model.projector[-1].weight.grad is not None
+
+    def test_dict_forward_in_eval(self):
+        """Single-image eval batches return embeddings and labels, no loss."""
+        model = spt.VIbCReg(
+            encoder_name=_TinyEncoder(), projector_dims=(64, 64), iternorm_groups=8
+        )
         model.eval()
+        batch = {"image": torch.randn(8, 3, 16, 16), "label": torch.arange(8)}
+
         with torch.no_grad():
-            out = model(v1)
-        assert out.embedding.shape == (8, 32)
-        assert out.projection is None
-        assert out.loss.item() == 0
+            out = model(batch, stage="validate")
+
+        assert "loss" not in out
+        assert out["embedding"].shape == (8, 32)
+        assert torch.equal(out["label"], torch.arange(8))
 
     def test_forward_function_with_module(self):
         """The ``vibcreg`` forward fn trains end-to-end inside ``spt.Module``."""
@@ -298,7 +320,7 @@ class TestVIbCRegMethod:
             ]
         }
 
-        out = module.forward(batch, "train")
+        out = module.forward(batch, "fit")
         out["loss"].backward()
 
         assert out["embedding"].shape == (16, 32)
@@ -315,4 +337,4 @@ class TestVIbCRegMethod:
         batch = {"views": [{"image": torch.randn(4, 3, 16, 16)} for _ in range(3)]}
 
         with pytest.raises(ValueError, match="exactly 2 views"):
-            module.forward(batch, "train")
+            module.forward(batch, "fit")

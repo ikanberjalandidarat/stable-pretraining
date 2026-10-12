@@ -49,8 +49,9 @@ def _get_views_list(batch: dict):
     if "views" in batch:
         return batch["views"]
     elif "image" not in batch:
-        # Dict of named views - convert to list
-        return list(batch.values())
+        # Dict of named views - convert to list. Non-dict entries are metadata
+        # such as the ``batch_idx`` that ``Module.training_step`` injects.
+        return [v for v in batch.values() if isinstance(v, dict)]
     else:
         # Single view, return None as sentinel
         return None
@@ -519,6 +520,8 @@ def vibcreg(self, batch: dict[str, Any], stage: str) -> dict[str, torch.Tensor]:
             out["label"] = torch.cat([view["label"] for view in views], dim=0)
 
         if self.training:
+            # Each view is projected separately so IterNorm whitens per view,
+            # as in the reference implementation.
             projections = [self.projector(emb) for emb in embeddings]
             out["loss"] = self.vibcreg_loss(projections[0], projections[1])
             self.log(

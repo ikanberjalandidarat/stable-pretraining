@@ -10,36 +10,38 @@ The defaults (2048-d GELU projector, IterNorm with 64 groups and 5 iterations,
 loss weights 25/25/200) follow the solo-learn recipe behind the reference
 CIFAR-10 results.
 
+Example::
+
+    import lightning as pl
+    import stable_pretraining as spt
+    from stable_pretraining.methods import VIbCReg
+
+    model = VIbCReg("resnet18", low_resolution=True)
+    model.optim = {
+        "optimizer": {"type": "LARS", "lr": 0.3, "weight_decay": 1e-4},
+        "scheduler": {"type": "LinearWarmupCosineAnnealing"},
+        "interval": "step",
+    }
+    manager = spt.Manager(
+        trainer=pl.Trainer(max_epochs=1000), module=model, data=datamodule
+    )
+    manager()
+
 References:
     Lee, Aune. "VIbCReg: Variance-Invariance-better-Covariance Regularization
     for Self-Supervised Learning on Time Series." arXiv 2021.
     https://arxiv.org/abs/2109.00783
 """
 
-from dataclasses import dataclass
-from typing import Optional, Sequence, Union
+from typing import Any, Sequence, Union
 
 import torch
 import torch.nn as nn
-from transformers.utils import ModelOutput
 
 from stable_pretraining import Module
 from stable_pretraining.backbone import IterNorm, from_timm
+from stable_pretraining.forward import vibcreg as vibcreg_forward
 from stable_pretraining.losses import VIbCRegLoss
-
-
-@dataclass
-class VIbCRegOutput(ModelOutput):
-    """Output from VIbCReg forward pass.
-
-    :ivar loss: VIbCReg loss (0 in eval mode)
-    :ivar embedding: Backbone features [B, D] (eval) or [2B, D] (train)
-    :ivar projection: Projector outputs [2B, P] (None in eval)
-    """
-
-    loss: torch.Tensor = None
-    embedding: torch.Tensor = None
-    projection: Optional[torch.Tensor] = None
 
 
 def _build_vibcreg_projector(
@@ -120,28 +122,29 @@ class VIbCReg(Module):
             sim_coeff=sim_coeff, std_coeff=std_coeff, cov_coeff=cov_coeff
         )
 
-    def forward(
-        self,
-        view1: torch.Tensor,
-        view2: Optional[torch.Tensor] = None,
-    ) -> VIbCRegOutput:
-        if view2 is None:
-            embedding = self.backbone(view1)
-            return VIbCRegOutput(
-                loss=torch.zeros((), device=embedding.device, dtype=embedding.dtype),
-                embedding=embedding,
-                projection=None,
-            )
+    def forward(self, batch: dict[str, Any], stage: str) -> dict[str, torch.Tensor]:
+        """VIbCReg forward on a dataloader batch.
 
-        h1 = self.backbone(view1)
-        h2 = self.backbone(view2)
-        # Each view is projected separately so IterNorm whitens per view,
-        # as in the reference implementation.
-        z1 = self.projector(h1)
-        z2 = self.projector(h2)
-        loss = self.vibcreg_loss(z1, z2)
-        return VIbCRegOutput(
-            loss=loss,
-            embedding=torch.cat([h1, h2], dim=0),
-            projection=torch.cat([z1, z2], dim=0),
-        )
+        Delegates to :func:`stable_pretraining.forward.vibcreg`, so the method
+        class and the forward-function form share one implementation.
+
+        Expected batch keys:
+
+            - **Training**: two views, either as ``{"views": [view_0, view_1]}``
+              or as a dict of named views (the output of
+              :class:`~stable_pretraining.data.transforms.MultiViewTransform`).
+              Each view is a dict with ``"image"`` ``[B, C, H, W]`` and
+              optionally ``"label"`` ``[B]``.
+            - **Eval**: ``"image"`` ``[B, C, H, W]`` and optionally ``"label"`` ``[B]``.
+
+        :param batch: Batch dictionary from the dataloader.
+        :param stage: Lightning stage string (``"fit"``, ``"validate"``,
+            ``"test"``, or ``"predict"``).
+        :return: Dictionary with:
+
+            - ``"loss"``: VIbCReg loss (training only)
+            - ``"embedding"``: Backbone features, ``[2B, D]`` in training
+              (both views) and ``[B, D]`` in eval
+            - ``"label"``: Labels if present, repeated to match ``"embedding"``
+        """
+        return vibcreg_forward(self, batch, stage)

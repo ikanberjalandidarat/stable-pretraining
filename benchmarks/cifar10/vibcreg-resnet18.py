@@ -1,13 +1,22 @@
-"""VIbCReg training on CIFAR-10.
+"""VIbCReg training on CIFAR-10, with the VICReg baseline and IterNorm ablation.
 
-Follows the solo-learn recipe behind the reference result (ResNet-18,
-1000 epochs, 91.18% online linear top-1): 2048-d GELU projector ending in
-IterNorm, loss weights 25/25/200, LARS with lr 0.3, 10 warmup epochs.
+Follows the solo-learn recipes behind the reference results (ResNet-18,
+1000 epochs, online linear top-1):
+
+- ``--method vibcreg`` (91.18%): 2048-d GELU projector ending in IterNorm,
+  loss weights 25/25/200, LARS with lr 0.3, 10 warmup epochs.
+- ``--method vicreg`` (92.07%): 2048-d ReLU projector, loss weights 25/25/1,
+  same optimizer with LARS ``clip_lr``.
+
+Both share the augmentations, backbone, optimizer and schedule, so they differ
+only where the two methods do.
 
 Usage:
     python benchmarks/cifar10/vibcreg-resnet18.py
-    python benchmarks/cifar10/vibcreg-resnet18.py --epochs 200 --wandb-project my-project
+    python benchmarks/cifar10/vibcreg-resnet18.py --method vicreg
+    python benchmarks/cifar10/vibcreg-resnet18.py --no-iternorm  # ablation
     python benchmarks/cifar10/vibcreg-resnet18.py --epochs 2 --limit-batches 5  # smoke check
+    python benchmarks/cifar10/vibcreg-resnet18.py --ckpt-path /abs/path/last.ckpt  # resume
 """
 
 import argparse
@@ -29,10 +38,17 @@ sys.path.append(str(Path(__file__).parent.parent))
 from utils import get_data_dir
 
 WARMUP_EPOCHS = 10
+PROJECTOR_DIM = 2048
 
 
 def _parse_args():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--method", choices=["vibcreg", "vicreg"], default="vibcreg")
+    parser.add_argument(
+        "--no-iternorm",
+        action="store_true",
+        help="VIbCReg without the IterNorm layer (ablation).",
+    )
     parser.add_argument("--epochs", type=int, default=1000)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--num-workers", type=int, default=8)
@@ -44,7 +60,16 @@ def _parse_args():
         default=None,
         help="Cap train/val batches per epoch, for a quick end-to-end check.",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--ckpt-path",
+        type=str,
+        default=None,
+        help="Absolute path to a last.ckpt to resume training from.",
+    )
+    args = parser.parse_args()
+    if args.no_iternorm and args.method != "vibcreg":
+        parser.error("--no-iternorm only applies to --method vibcreg")
+    return args
 
 
 def _view_transform():
@@ -74,10 +99,71 @@ def _warmup_cosine(optimizer, module, epochs):
     )
 
 
+def _cifar_resnet18():
+    backbone = spt.backbone.from_torchvision("resnet18", low_resolution=True)
+    backbone.fc = nn.Identity()
+    return backbone
+
+
+def _build_module(args):
+    if args.method == "vibcreg":
+        module = spt.VIbCReg(
+            encoder_name=_cifar_resnet18(),
+            projector_dims=(PROJECTOR_DIM,) * 3,
+            sim_coeff=25.0,
+            std_coeff=25.0,
+            cov_coeff=200.0,
+            iternorm=not args.no_iternorm,
+        )
+        clip_lr = False
+    else:
+        # The VICReg method class predates the dict forward(batch, stage)
+        # contract, so the baseline is assembled from the forward function.
+        module = spt.Module(
+            backbone=_cifar_resnet18(),
+            projector=nn.Sequential(
+                nn.Linear(512, PROJECTOR_DIM),
+                nn.BatchNorm1d(PROJECTOR_DIM),
+                nn.ReLU(),
+                nn.Linear(PROJECTOR_DIM, PROJECTOR_DIM),
+                nn.BatchNorm1d(PROJECTOR_DIM),
+                nn.ReLU(),
+                nn.Linear(PROJECTOR_DIM, PROJECTOR_DIM),
+            ),
+            forward=forward.vicreg,
+            vicreg_loss=spt.losses.VICRegLoss(
+                sim_coeff=25.0, std_coeff=25.0, cov_coeff=1.0
+            ),
+        )
+        clip_lr = True
+
+    module.optim = {
+        "optimizer": {
+            "type": "LARS",
+            "lr": 0.3,
+            "momentum": 0.9,
+            "weight_decay": 1e-4,
+            "eta": 0.02,
+            "clip_lr": clip_lr,
+            "exclude_bias_n_norm": True,
+        },
+        "scheduler": lambda optimizer, module: _warmup_cosine(
+            optimizer, module, args.epochs
+        ),
+        "interval": "step",
+    }
+    return module
+
+
+def _run_name(args):
+    name = args.method + ("-no-iternorm" if args.no_iternorm else "")
+    return f"{name}-resnet18-{args.epochs}ep"
+
+
 def main():
     args = _parse_args()
 
-    vibcreg_transform = transforms.MultiViewTransform(
+    train_transform = transforms.MultiViewTransform(
         [_view_transform(), _view_transform()]
     )
     val_transform = transforms.Compose(
@@ -97,7 +183,7 @@ def main():
     train_dataset = spt.data.FromTorchDataset(
         cifar_train,
         names=["image", "label"],
-        transform=vibcreg_transform,
+        transform=train_transform,
     )
     val_dataset = spt.data.FromTorchDataset(
         cifar_val,
@@ -120,48 +206,7 @@ def main():
     )
 
     data = spt.data.DataModule(train=train_dataloader, val=val_dataloader)
-
-    backbone = spt.backbone.from_torchvision(
-        "resnet18",
-        low_resolution=True,
-    )
-    backbone.fc = torch.nn.Identity()
-
-    projector = nn.Sequential(
-        nn.Linear(512, 2048),
-        nn.BatchNorm1d(2048),
-        nn.GELU(),
-        nn.Linear(2048, 2048),
-        nn.BatchNorm1d(2048),
-        nn.GELU(),
-        nn.Linear(2048, 2048),
-        spt.backbone.IterNorm(2048, num_groups=64, T=5),
-    )
-
-    module = spt.Module(
-        backbone=backbone,
-        projector=projector,
-        forward=forward.vibcreg,
-        vibcreg_loss=spt.losses.VIbCRegLoss(
-            sim_coeff=25.0,
-            std_coeff=25.0,
-            cov_coeff=200.0,
-        ),
-        optim={
-            "optimizer": {
-                "type": "LARS",
-                "lr": 0.3,
-                "momentum": 0.9,
-                "weight_decay": 1e-4,
-                "eta": 0.02,
-                "exclude_bias_n_norm": True,
-            },
-            "scheduler": lambda optimizer, module: _warmup_cosine(
-                optimizer, module, args.epochs
-            ),
-            "interval": "step",
-        },
-    )
+    module = _build_module(args)
 
     linear_probe = spt.callbacks.OnlineProbe(
         module,
@@ -191,7 +236,7 @@ def main():
         logger = WandbLogger(
             entity=args.wandb_entity,
             project=args.wandb_project,
-            name=f"vibcreg-resnet18-{args.epochs}ep",
+            name=_run_name(args),
             log_model=False,
         )
 
@@ -205,7 +250,13 @@ def main():
         limit_val_batches=args.limit_batches,
     )
 
-    manager = spt.Manager(trainer=trainer, module=module, data=data)
+    manager = spt.Manager(
+        trainer=trainer,
+        module=module,
+        data=data,
+        ckpt_path=args.ckpt_path,
+        weights_only=False,
+    )
     manager()
 
 

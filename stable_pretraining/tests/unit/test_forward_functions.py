@@ -459,3 +459,12 @@ class TestForwardFunctionsWithBenchmarkTransforms:
         assert "embedding" in result
         assert "logits" in result
         assert "loss" in result
+
+
+@pytest.mark.unit
+def test_named_views_ignore_injected_metadata():
+    """``batch_idx`` injected by ``Module.training_step`` is not a view."""
+    views = [{"image": torch.randn(2, 3, 8, 8)} for _ in range(2)]
+    batch = {"view_0": views[0], "view_1": views[1], "batch_idx": 3}
+
+    assert forward_module._get_views_list(batch) == views
