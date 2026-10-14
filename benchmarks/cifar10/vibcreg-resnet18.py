@@ -15,6 +15,7 @@ Usage:
     python benchmarks/cifar10/vibcreg-resnet18.py
     python benchmarks/cifar10/vibcreg-resnet18.py --method vicreg
     python benchmarks/cifar10/vibcreg-resnet18.py --no-iternorm  # ablation
+    python benchmarks/cifar10/vibcreg-resnet18.py --seed 1  # repeat with another seed
     python benchmarks/cifar10/vibcreg-resnet18.py --epochs 2 --limit-batches 5  # smoke check
     python benchmarks/cifar10/vibcreg-resnet18.py --ckpt-path /abs/path/last.ckpt  # resume
 """
@@ -50,6 +51,7 @@ def _parse_args():
         help="VIbCReg without the IterNorm layer (ablation).",
     )
     parser.add_argument("--epochs", type=int, default=1000)
+    parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument("--wandb-project", type=str, default=None)
@@ -157,7 +159,7 @@ def _build_module(args):
 
 def _run_name(args):
     name = args.method + ("-no-iternorm" if args.no_iternorm else "")
-    return f"{name}-resnet18-{args.epochs}ep"
+    return f"{name}-resnet18-{args.epochs}ep-seed{args.seed}"
 
 
 def main():
@@ -254,6 +256,7 @@ def main():
         trainer=trainer,
         module=module,
         data=data,
+        seed=args.seed,
         ckpt_path=args.ckpt_path,
         weights_only=False,
     )
