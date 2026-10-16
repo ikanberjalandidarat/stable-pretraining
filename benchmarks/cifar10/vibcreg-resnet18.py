@@ -16,6 +16,7 @@ Usage:
     python benchmarks/cifar10/vibcreg-resnet18.py --method vicreg
     python benchmarks/cifar10/vibcreg-resnet18.py --no-iternorm  # ablation
     python benchmarks/cifar10/vibcreg-resnet18.py --seed 1  # repeat with another seed
+    python benchmarks/cifar10/vibcreg-resnet18.py --iternorm-lars --probe-schedule warmup-cosine
     python benchmarks/cifar10/vibcreg-resnet18.py --epochs 2 --limit-batches 5  # smoke check
     python benchmarks/cifar10/vibcreg-resnet18.py --ckpt-path /abs/path/last.ckpt  # resume
 """
@@ -50,6 +51,19 @@ def _parse_args():
         action="store_true",
         help="VIbCReg without the IterNorm layer (ablation).",
     )
+    parser.add_argument(
+        "--iternorm-lars",
+        action="store_true",
+        help="Apply LARS adaptation and weight decay to IterNorm's affine "
+        "parameters, as solo-learn does.",
+    )
+    parser.add_argument(
+        "--probe-schedule",
+        choices=["constant", "warmup-cosine"],
+        default="constant",
+        help="Learning-rate schedule of the online linear probe; solo-learn "
+        "decays it with the main warmup-cosine schedule.",
+    )
     parser.add_argument("--epochs", type=int, default=1000)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--batch-size", type=int, default=256)
@@ -69,8 +83,10 @@ def _parse_args():
         help="Absolute path to a last.ckpt to resume training from.",
     )
     args = parser.parse_args()
-    if args.no_iternorm and args.method != "vibcreg":
-        parser.error("--no-iternorm only applies to --method vibcreg")
+    if args.method != "vibcreg" and (args.no_iternorm or args.iternorm_lars):
+        parser.error("--no-iternorm / --iternorm-lars only apply to --method vibcreg")
+    if args.no_iternorm and args.iternorm_lars:
+        parser.error("--iternorm-lars needs IterNorm; drop --no-iternorm")
     return args
 
 
@@ -107,6 +123,16 @@ def _cifar_resnet18():
     return backbone
 
 
+def _make_iternorm_affine_2d(module):
+    # LARS with exclude_bias_n_norm skips adaptation and weight decay for 1-D
+    # parameters. solo-learn stores IterNorm's affine parameters as [1, D], so
+    # they are adapted like weight matrices; reshaping reproduces that.
+    for m in module.modules():
+        if isinstance(m, spt.backbone.IterNorm) and m.affine:
+            m.weight = nn.Parameter(m.weight.detach().reshape(1, -1))
+            m.bias = nn.Parameter(m.bias.detach().reshape(1, -1))
+
+
 def _build_module(args):
     if args.method == "vibcreg":
         module = spt.VIbCReg(
@@ -117,6 +143,8 @@ def _build_module(args):
             cov_coeff=200.0,
             iternorm=not args.no_iternorm,
         )
+        if args.iternorm_lars:
+            _make_iternorm_affine_2d(module)
         clip_lr = False
     else:
         # The VICReg method class predates the dict forward(batch, stage)
@@ -159,6 +187,8 @@ def _build_module(args):
 
 def _run_name(args):
     name = args.method + ("-no-iternorm" if args.no_iternorm else "")
+    name += "-iternorm-lars" if args.iternorm_lars else ""
+    name += "-probe-cosine" if args.probe_schedule == "warmup-cosine" else ""
     return f"{name}-resnet18-{args.epochs}ep-seed{args.seed}"
 
 
@@ -221,6 +251,11 @@ def main():
             "top1": torchmetrics.classification.MulticlassAccuracy(10),
             "top5": torchmetrics.classification.MulticlassAccuracy(10, top_k=5),
         },
+        scheduler=(
+            (lambda optimizer, module: _warmup_cosine(optimizer, module, args.epochs))
+            if args.probe_schedule == "warmup-cosine"
+            else None
+        ),
     )
 
     knn_probe = spt.callbacks.OnlineKNN(
